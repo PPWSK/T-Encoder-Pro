@@ -1,7 +1,7 @@
 
 #include "ui.h"
 #include "Arduino.h"
-#include "screen/screen.h"
+#include "screen.h"
 
 lv_coord_t lcd_width = -1;
 lv_coord_t lcd_height = -1;

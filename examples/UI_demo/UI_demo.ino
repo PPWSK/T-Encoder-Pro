@@ -1,7 +1,7 @@
 #include "ui.h"
-#include "screen/screen.h"
-#include "port/lv_port_disp.h"
-#include "port/lv_port_indev.h"
+#include "screen.h"
+#include "lv_port_disp.h"
+#include "lv_port_indev.h"
 #include "pin_config.h"
 #include <WiFi.h>
 #include <FastLED.h>

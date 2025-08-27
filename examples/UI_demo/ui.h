@@ -3,9 +3,9 @@
  *********************************************************************************/
 #pragma once
 #include "lvgl.h"
-#include "event/scr_mrg.h"
-#include "assets/assets.h"
-#include "port/lv_port_indev.h"
+#include "scr_mrg.h"
+#include "assets.h"
+#include "lv_port_indev.h"
 
 /*********************************************************************************
  *                               macro

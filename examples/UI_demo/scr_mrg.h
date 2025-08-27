@@ -1,7 +1,6 @@
 #pragma once
 #include "lvgl.h"
 #include <Arduino.h>
-#include "ui.h"
 
 #define SCR_MGR_ANIM_TIME 500
 #define SCR_MGR_SCR_SWITCH_ANIM    LV_SCR_LOAD_ANIM_NONE
