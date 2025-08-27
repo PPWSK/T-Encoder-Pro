@@ -81,7 +81,7 @@ void onRxNotify(NimBLERemoteCharacteristic* pRemoteCharacteristic, uint8_t* pDat
 }
 
 // Scan for MOON devices for a given number of seconds
-void scanForMoonDevices(uint32_t scanTimeSeconds = 5) {
+void scanForMoonDevices(uint32_t scanTimeSeconds) {
     foundDevices.clear();
     NimBLEScan* pScan = NimBLEDevice::getScan();
     pScan->setAdvertisedDeviceCallbacks(new MoonAdvertisedDeviceCallbacks(), true);
