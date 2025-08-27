@@ -11,6 +11,8 @@
 
 #include <vector>
 #include <Arduino.h>
+#include <NimBLEDevice.h>
+#include <NimBLEAdvertisedDevice.h>
 
 // Forward declare LVGL types to avoid including the full LVGL header
 // unless needed. If your compile unit already includes lvgl.h you
@@ -19,7 +21,12 @@ struct _lv_obj_t;
 typedef struct _lv_obj_t lv_obj_t;
 
 // Structure to hold discovered device information. See
-// moon_encoder_ble.cpp for implementation details.
+// moon_encoder_ble.cpp for implementation details. We include
+// NimBLEAdvertisedDevice here directly to ensure the compiler knows
+// about this type when instantiating MoonDeviceInfo. Without this
+// include, compilation fails with "NimBLEAdvertisedDevice does not
+// name a type" errors when building sketches that include this
+// header but not the NimBLE headers.
 struct MoonDeviceInfo {
     NimBLEAdvertisedDevice* device;
     int rssi;

@@ -15,27 +15,33 @@
 
 #include "lvgl.h"
 #include <stdio.h>
-#include "ui.h"
+
+// Forward declare the lv_ui struct to satisfy the function signature. We
+// do not dereference the ui pointer in this file; instead we
+// create and load our own screen directly via LVGL. This avoids
+// depending on the exact definition of lv_ui from ui.h, which may
+// differ between versions.
+struct lv_ui;
+
 #include "moon_encoder_ble.h"
 
-void scr5_test(lv_ui *ui)
-{
-    // Create a fresh screen and set its size to the full display. If your
-    // project uses CIT_UI.LCD_Width/Height these globals can be used to
-    // size the screen; otherwise adjust as needed.
-    ui->Test = lv_obj_create(NULL);
-    lv_obj_set_size(ui->Test, CIT_UI.LCD_Width, CIT_UI.LCD_Height);
-    lv_obj_set_scrollbar_mode(ui->Test, LV_SCROLLBAR_MODE_OFF);
+void scr5_test(lv_ui * /*ui*/) {
+    // Create a new screen and set its size to the full display. We do
+    // not rely on the UI struct from ui.h; instead we explicitly
+    // create and load our own screen. This avoids needing to know
+    // the exact definition of lv_ui in v2.0.14.
+    lv_obj_t *screen = lv_obj_create(NULL);
+    uint16_t disp_w = lv_disp_get_hor_res(NULL);
+    uint16_t disp_h = lv_disp_get_ver_res(NULL);
+    lv_obj_set_size(screen, disp_w, disp_h);
+    lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
     // Set a white background
-    lv_obj_set_style_bg_opa(ui->Test, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(ui->Test, lv_color_hex(0xffffff), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(screen, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(0xffffff), LV_PART_MAIN | LV_STATE_DEFAULT);
 
-    // Create a label at the top of the screen for status messages. This
-    // will show scan progress and is also wired into the BLE module via
-    // setBleLogLabel() so that log messages from the BLE code are
-    // forwarded here automatically.
-    lv_obj_t *log_label = lv_label_create(ui->Test);
-    lv_obj_set_width(log_label, CIT_UI.LCD_Width);
+    // Create a label at the top of the screen for status messages.
+    lv_obj_t *log_label = lv_label_create(screen);
+    lv_obj_set_width(log_label, disp_w);
     lv_obj_set_height(log_label, 20);
     lv_label_set_long_mode(log_label, LV_LABEL_LONG_WRAP);
     lv_obj_align(log_label, LV_ALIGN_TOP_MID, 0, 4);
@@ -56,15 +62,16 @@ void scr5_test(lv_ui *ui)
         lv_label_set_text(log_label, "No MOON devices found");
     } else {
         // Create a table to list devices. Two columns: name and RSSI.
-        lv_obj_t *table = lv_table_create(ui->Test);
+        lv_obj_t *table = lv_table_create(screen);
         // Position the table below the log label
         lv_obj_set_pos(table, 0, 30);
-        lv_obj_set_size(table, CIT_UI.LCD_Width, CIT_UI.LCD_Height - 30);
+        // Set table size to fill the screen below the log label
+        lv_obj_set_size(table, disp_w, disp_h - 30);
         lv_table_set_col_cnt(table, 2);
         lv_table_set_row_cnt(table, foundDevices.size());
         // Adjust column widths: name column wider than RSSI
-        lv_table_set_col_width(table, 0, (CIT_UI.LCD_Width * 2) / 3);
-        lv_table_set_col_width(table, 1, CIT_UI.LCD_Width / 3);
+        lv_table_set_col_width(table, 0, (disp_w * 2) / 3);
+        lv_table_set_col_width(table, 1, disp_w / 3);
         // Populate table rows
         for (size_t i = 0; i < foundDevices.size(); ++i) {
             MoonDeviceInfo &info = foundDevices[i];
@@ -85,8 +92,8 @@ void scr5_test(lv_ui *ui)
         }
     }
 
+    // Load our screen onto the display
+    lv_scr_load(screen);
     // Update layout to ensure all children are properly positioned
-    lv_obj_update_layout(ui->Test);
-    // Mark this screen as created so events_init can reuse/destroy it
-    ui->Test_del = false;
+    lv_obj_update_layout(screen);
 }

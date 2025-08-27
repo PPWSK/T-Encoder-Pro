@@ -9,23 +9,27 @@
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
+#include <NimBLEAdvertisedDevice.h>
+#include "moon_encoder_ble.h"
 // Pull in LVGL for on-screen logging.  If you don't need to log to
 // the screen you can remove this include; however setBleLogLabel()
 // and updateBleLog() rely on lv_label_set_text().
 #include "lvgl.h"
 
-// Nordic UART Service UUIDs (commonly used for BLE UART)
-static const char* NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-static const char* NUS_TX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
-static const char* NUS_RX_CHAR_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+// Nordic UART Service UUIDs (commonly used for BLE UART). Use NimBLEUUID
+// objects rather than const char* so that they can be passed directly
+// into NimBLE API functions without implicit conversions. Using
+// NimBLEUUID avoids ambiguous overload resolution errors when
+// interacting with NimBLE functions such as isAdvertisingService().
+static const NimBLEUUID NUS_SERVICE_UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+static const NimBLEUUID NUS_TX_CHAR_UUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
+static const NimBLEUUID NUS_RX_CHAR_UUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
 
-// Structure to hold discovered device information
-struct MoonDeviceInfo {
-    NimBLEAdvertisedDevice* device;
-    int rssi;
-};
+// Note: The MoonDeviceInfo structure is defined in moon_encoder_ble.h. We do
+// not redefine it here to avoid duplicate definition errors.
 
-static std::vector<MoonDeviceInfo> foundDevices;
+// Global container defined here; declared extern in moon_encoder_ble.h
+std::vector<MoonDeviceInfo> foundDevices;
 static NimBLEClient* moonClient = nullptr;
 static NimBLERemoteCharacteristic* txCharacteristic = nullptr;
 static NimBLERemoteCharacteristic* rxCharacteristic = nullptr;
@@ -157,6 +161,16 @@ static void updateBleLog(const String& msg) {
     }
 }
 
+/*
+ * Stand‑alone demonstration entry points. These functions allow this
+ * module to be compiled as an example sketch on its own. When
+ * integrated into the UI demo firmware the UI code will provide its
+ * own setup() and loop() functions, so these definitions should be
+ * excluded. To enable the stand‑alone example define
+ * MOON_ENCODER_BLE_STANDALONE before including this file.
+ */
+#ifdef MOON_ENCODER_BLE_STANDALONE
+
 void setup() {
     Serial.begin(115200);
     Serial.println("Moon Encoder BLE Client starting...");
@@ -180,3 +194,5 @@ void loop() {
     }
     delay(1000);
 }
+
+#endif // MOON_ENCODER_BLE_STANDALONE
