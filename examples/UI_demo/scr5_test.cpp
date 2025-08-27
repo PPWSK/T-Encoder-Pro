@@ -1,99 +1,95 @@
-/*
- * Custom Test screen for the T‑Encoder‑Pro (screen 5 in the V2.0.14 firmware).
- *
- * This screen replaces the default pass/fail button matrix with a BLE
- * device scanner. When entered from the home menu it will perform a
- * synchronous BLE scan using the functions in moon_encoder_ble.cpp and
- * display the results in a two column table. If no MOON devices are
- * discovered the screen will show a message indicating this fact.
- *
- * To hook this screen into your existing project replace the contents of
- * scr5_test.cpp in the examples/Lvgl_CIT folder (or your 2.0.14
- * equivalent) with this file. You must also ensure that
- * moon_encoder_ble.h/cpp are compiled as part of your Arduino project.
- */
-
-#include "lvgl.h"
-#include <stdio.h>
-
-// Forward declare the lv_ui struct to satisfy the function signature. We
-// do not dereference the ui pointer in this file; instead we
-// create and load our own screen directly via LVGL. This avoids
-// depending on the exact definition of lv_ui from ui.h, which may
-// differ between versions.
-struct lv_ui;
-
+// scr5_test.cpp — live MOON scan demo using the async snapshot API
+#include <lvgl.h>
+#include <vector>
+#include <string>
 #include "moon_encoder_ble.h"
 
-void scr5_test(lv_ui * /*ui*/) {
-    // Create a new screen and set its size to the full display. We do
-    // not rely on the UI struct from ui.h; instead we explicitly
-    // create and load our own screen. This avoids needing to know
-    // the exact definition of lv_ui in v2.0.14.
-    lv_obj_t *screen = lv_obj_create(NULL);
-    uint16_t disp_w = lv_disp_get_hor_res(NULL);
-    uint16_t disp_h = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(screen, disp_w, disp_h);
-    lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
-    // Set a white background
-    lv_obj_set_style_bg_opa(screen, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0xffffff), LV_PART_MAIN | LV_STATE_DEFAULT);
+// If your project defines lv_ui, we keep the signature; we don't use 'ui'.
+struct lv_ui;
 
-    // Create a label at the top of the screen for status messages.
-    lv_obj_t *log_label = lv_label_create(screen);
-    lv_obj_set_width(log_label, disp_w);
-    lv_obj_set_height(log_label, 20);
-    lv_label_set_long_mode(log_label, LV_LABEL_LONG_WRAP);
-    lv_obj_align(log_label, LV_ALIGN_TOP_MID, 0, 4);
-    lv_label_set_text(log_label, "Scanning...");
+static lv_obj_t* s_status = nullptr;
+static lv_obj_t* s_table  = nullptr;
+static lv_timer_t* s_timer = nullptr;
+static std::vector<MoonDeviceInfo> s_snapshot;
 
-    // Register the label with the BLE module so messages are displayed
-    setBleLogLabel(log_label);
+static void fill_table() {
+    if (!s_table) return;
 
-    // Perform a synchronous scan for MOON devices. This call blocks for
-    // the specified duration. All discovered devices are stored in
-    // foundDevices.
-    scanForMoonDevices(5);
+    lv_table_set_col_cnt(s_table, 2);
+    lv_table_set_row_cnt(s_table, s_snapshot.size() + 1);
+    lv_table_set_cell_value(s_table, 0, 0, "Name / MAC");
+    lv_table_set_cell_value(s_table, 0, 1, "RSSI");
 
-    // After scanning, check whether any devices were found. If not,
-    // display an informative message. Otherwise build a table of device
-    // names and RSSI values.
-    if (foundDevices.empty()) {
-        lv_label_set_text(log_label, "No MOON devices found");
-    } else {
-        // Create a table to list devices. Two columns: name and RSSI.
-        lv_obj_t *table = lv_table_create(screen);
-        // Position the table below the log label
-        lv_obj_set_pos(table, 0, 30);
-        // Set table size to fill the screen below the log label
-        lv_obj_set_size(table, disp_w, disp_h - 30);
-        lv_table_set_col_cnt(table, 2);
-        lv_table_set_row_cnt(table, foundDevices.size());
-        // Adjust column widths: name column wider than RSSI
-        lv_table_set_col_width(table, 0, (disp_w * 2) / 3);
-        lv_table_set_col_width(table, 1, disp_w / 3);
-        // Populate table rows
-        for (size_t i = 0; i < foundDevices.size(); ++i) {
-            MoonDeviceInfo &info = foundDevices[i];
-            const char *name;
-            if (info.device->haveName()) {
-                name = info.device->getName().c_str();
-            } else {
-                // Use the address string if no name is advertised
-                name = info.device->toString().c_str();
-            }
-            // Set device name in first column
-            lv_table_set_cell_value(table, i, 0, name);
-            // Format RSSI as a string
-            char rssi_buf[16];
-            snprintf(rssi_buf, sizeof(rssi_buf), "%d", info.rssi);
-            // Set RSSI in second column
-            lv_table_set_cell_value(table, i, 1, rssi_buf);
-        }
+    for (uint16_t i = 0; i < s_snapshot.size(); ++i) {
+        const auto& d = s_snapshot[i];
+        lv_table_set_cell_value(s_table, i + 1, 0, d.name.c_str());
+        char r[16]; snprintf(r, sizeof(r), "%d", d.rssi);
+        lv_table_set_cell_value(s_table, i + 1, 1, r);
     }
 
-    // Load our screen onto the display
-    lv_scr_load(screen);
-    // Update layout to ensure all children are properly positioned
-    lv_obj_update_layout(screen);
+    if (s_status) {
+        if (s_snapshot.empty())
+            lv_label_set_text(s_status, isScanning() ? "Scanning…" : "No MOONs found");
+        else
+            lv_label_set_text(s_status, isScanning() ? "Scanning… (tap to connect)" : "Tap a MOON to connect");
+    }
+}
+
+static void on_table_click(lv_event_t *e) {
+    lv_obj_t *tbl = lv_event_get_target(e);
+    uint16_t row = LV_TABLE_CELL_NONE, col = LV_TABLE_CELL_NONE;
+    lv_table_get_selected_cell(tbl, &row, &col);
+    if (row == LV_TABLE_CELL_NONE || row == 0) return;
+
+    uint16_t idx = row - 1;
+    if (idx >= s_snapshot.size()) return;
+
+    const auto &sel = s_snapshot[idx];
+    connectToAddress(sel.mac);   // keep UI here; connect logs via Serial
+}
+
+static void timer_cb(lv_timer_t *) {
+    // Pump one pending status line (optional)
+    String line;
+    if (blePopUiLog(line) && s_status) lv_label_set_text(s_status, line.c_str());
+
+    // Refresh table when the device DB changed
+    std::vector<MoonDeviceInfo> now;
+    if (bleCopySnapshot(now)) {
+        s_snapshot.swap(now);
+        fill_table();
+    }
+}
+
+void scr5_test(lv_ui *ui) {
+    LV_UNUSED(ui);
+
+    lv_obj_t* parent = lv_scr_act();
+
+    // Status label
+    s_status = lv_label_create(parent);
+    lv_obj_set_width(s_status, 280);
+    lv_label_set_text(s_status, "Preparing scan…");
+    lv_obj_set_style_text_align(s_status, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_status, &lv_font_montserrat_18, LV_PART_MAIN);
+    lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 24);
+
+    // Table
+    s_table = lv_table_create(parent);
+    lv_table_set_col_cnt(s_table, 2);
+    lv_table_set_row_cnt(s_table, 1);
+    lv_table_set_col_width(s_table, 0, 160);
+    lv_table_set_col_width(s_table, 1, 60);
+    lv_obj_set_style_text_font(s_table, &lv_font_montserrat_14, LV_PART_ITEMS);
+    lv_obj_align(s_table, LV_ALIGN_TOP_MID, 0, 64);
+    lv_obj_add_flag(s_table, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_table, on_table_click, LV_EVENT_CLICKED, NULL);
+
+    // Start non-blocking scan and UI refresh
+    startScanAsync(10);
+    if (s_timer) lv_timer_del(s_timer);
+    s_timer = lv_timer_create(timer_cb, 500, NULL);
+
+    s_snapshot.clear();
+    fill_table();
 }

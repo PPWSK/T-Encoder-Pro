@@ -1,198 +1,261 @@
-// Moon Encoder BLE Client Example
-// This sketch shows how to discover nearby MOON devices over BLE, connect to
-// the one with the strongest signal, and send JSON commands to control
-// brightness, color temperature or moon phase.
-//
-// It uses the NimBLE-Arduino library, which is included with recent
-// ESP32 Arduino cores. Make sure to select the ESP32‑S3 board and install
-// the NimBLE library if needed.
-
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <NimBLEAdvertisedDevice.h>
+#include <unordered_map>
+#include <algorithm>
 #include "moon_encoder_ble.h"
-// Pull in LVGL for on-screen logging.  If you don't need to log to
-// the screen you can remove this include; however setBleLogLabel()
-// and updateBleLog() rely on lv_label_set_text().
-#include "lvgl.h"
 
-// Nordic UART Service UUIDs (commonly used for BLE UART). Use NimBLEUUID
-// objects rather than const char* so that they can be passed directly
-// into NimBLE API functions without implicit conversions. Using
-// NimBLEUUID avoids ambiguous overload resolution errors when
-// interacting with NimBLE functions such as isAdvertisingService().
+// -----------------------------
+// UART UUIDs (adjust if MOON differs from Nordic NUS)
+// -----------------------------
 static const NimBLEUUID NUS_SERVICE_UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
 static const NimBLEUUID NUS_TX_CHAR_UUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
 static const NimBLEUUID NUS_RX_CHAR_UUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
 
-// Note: The MoonDeviceInfo structure is defined in moon_encoder_ble.h. We do
-// not redefine it here to avoid duplicate definition errors.
+// -----------------------------
+// BLE link + state
+// -----------------------------
+static NimBLEClient*               s_client = nullptr;
+static NimBLERemoteCharacteristic* s_tx     = nullptr;
+static NimBLERemoteCharacteristic* s_rx     = nullptr;
+static std::string                 s_connectedMac;
 
-// Global container defined here; declared extern in moon_encoder_ble.h
-std::vector<MoonDeviceInfo> foundDevices;
-static NimBLEClient* moonClient = nullptr;
-static NimBLERemoteCharacteristic* txCharacteristic = nullptr;
-static NimBLERemoteCharacteristic* rxCharacteristic = nullptr;
+struct Rec { std::string name; int rssi = -127; bool moon=false; };
+static std::unordered_map<std::string, Rec> s_map;   // key=MAC
 
-// Pointer to an LVGL label for displaying log messages. When set via
-// setBleLogLabel() this label will be updated on each log event.
-static lv_obj_t* bleLogLabel = nullptr;
+static bool     s_bleInited   = false;
+static bool     s_scanning    = false;
+static uint32_t s_scanEnd     = 0;
+static volatile bool s_devicesDirty = false;
 
-// Forward declaration of helper so we can call it from different
-// functions. This function updates both Serial output and the LVGL
-// label if available.
-static void updateBleLog(const String& msg);
+// UI log handoff (status line)
+static volatile bool s_uiLogDirty = false;
+static String s_uiLine;
+static inline void uiLog(const String& msg){ Serial.println(msg); s_uiLine = msg; s_uiLogDirty = true; }
+bool blePopUiLog(String& out){ if(!s_uiLogDirty) return false; out = s_uiLine; s_uiLogDirty=false; return true; }
 
-// Callback class for advertised devices
-class MoonAdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
-public:
-    void onResult(NimBLEAdvertisedDevice* advertisedDevice) override {
-        // Filter by name or service UUID to find MOON devices. Here we
-        // check if the UART service UUID is advertised or if the name
-        // contains "MOON".
-        bool match = false;
-        if (advertisedDevice->haveServiceUUID() && advertisedDevice->isAdvertisingService(NUS_SERVICE_UUID)) {
-            match = true;
+// -----------------------------
+// Init
+// -----------------------------
+void initMoonBle(){
+    if (s_bleInited) return;
+    Serial.begin(115200);
+    Serial.println("[BLE] init");
+    NimBLEDevice::init("T-Encoder-Pro");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    s_bleInited = true;
+    Serial.println("[BLE] init done");
+}
+
+// -----------------------------
+// Filter: accept only MOON devices
+// -----------------------------
+static bool looksLikeMoon(NimBLEAdvertisedDevice* d){
+    if (d->haveName()){
+        String nm = d->getName().c_str(); nm.toUpperCase();
+        if (nm.startsWith("MOON")) return true;
+    }
+    if (d->haveManufacturerData()){
+        const std::string md = d->getManufacturerData(); // by value
+        for(size_t i=0;i+3<md.size();++i){
+            char m=md[i], o1=md[i+1], o2=md[i+2], n=md[i+3];
+            if ((m=='M'||m=='m')&&(o1=='O'||o1=='o')&&(o2=='O'||o2=='o')&&(n=='N'||n=='n'))
+                return true;
         }
-        if (advertisedDevice->haveName() && advertisedDevice->getName().find("MOON") != std::string::npos) {
-            match = true;
+    }
+    return false;
+}
+
+// -----------------------------
+// Scan callbacks (declare BEFORE startScanAsync)
+// -----------------------------
+class CB : public NimBLEAdvertisedDeviceCallbacks {
+    void onResult(NimBLEAdvertisedDevice* d) override {
+        const std::string mac = d->getAddress().toString();
+        Rec &r = s_map[mac];
+
+        if (d->haveName()) r.name = d->getName();
+        if (d->getRSSI() > r.rssi) r.rssi = d->getRSSI();
+
+        bool wasMoon = r.moon;
+        r.moon = looksLikeMoon(d);
+
+        if (r.moon && !wasMoon) {
+            uiLog(String("MOON ") + mac.c_str() + " (" + (r.name.empty()? "" : r.name.c_str()) + ")");
         }
-        if (match) {
-            // Copy device to store; we must clone because the device
-            // pointer goes out of scope after scanning stops.
-            NimBLEAdvertisedDevice* copy = new NimBLEAdvertisedDevice(*advertisedDevice);
-            foundDevices.push_back({copy, advertisedDevice->getRSSI()});
-            // Log discovery to Serial and UI
-            String line = String("Found device: ") + (copy->haveName() ? copy->getName().c_str() : copy->toString().c_str()) +
-                          String(" RSSI=") + String(advertisedDevice->getRSSI());
-            updateBleLog(line);
-        }
+        if (r.moon) s_devicesDirty = true;
     }
 };
 
-// Notification callback for data received from the MOON device
-void onRxNotify(NimBLERemoteCharacteristic* pRemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
-    // Print incoming data to Serial and update UI log
-    String line = "RX: ";
-    for (size_t i = 0; i < length; ++i) {
-        line += (char)pData[i];
+// Optional client callbacks for logging
+class ClientCB : public NimBLEClientCallbacks {
+    void onConnect(NimBLEClient* c) override { uiLog("Connected"); }
+    void onDisconnect(NimBLEClient* c) override { uiLog("Disconnected"); s_connectedMac.clear(); }
+};
+
+// -----------------------------
+// Scan control (non-blocking)
+// -----------------------------
+static void finishIfTimedOut() {
+    if (!s_scanning) return;
+    if ((int32_t)(millis() - s_scanEnd) >= 0){
+        NimBLEDevice::getScan()->stop();
+        s_scanning = false;
+        uiLog("Scan complete");
     }
-    updateBleLog(line);
 }
 
-// Scan for MOON devices for a given number of seconds
-void scanForMoonDevices(uint32_t scanTimeSeconds) {
-    foundDevices.clear();
-    NimBLEScan* pScan = NimBLEDevice::getScan();
-    pScan->setAdvertisedDeviceCallbacks(new MoonAdvertisedDeviceCallbacks(), true);
-    pScan->setActiveScan(true);
-    updateBleLog("Scanning for MOON devices...");
-    // Start scanning (blocking until complete when second argument is false)
-    pScan->start(scanTimeSeconds, false);
-    // Compose summary message
-    String summary = String("Scan complete, found ") + foundDevices.size() + " device" + (foundDevices.size() == 1 ? "" : "s");
-    updateBleLog(summary);
+void startScanAsync(uint32_t seconds){
+    initMoonBle();
+
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    static CB cb;
+
+    // Prepare fresh DB
+    scan->stop();
+    scan->clearResults();
+    s_map.clear();
+    s_devicesDirty = true;
+
+    scan->setAdvertisedDeviceCallbacks(&cb, /*wantDuplicates=*/false);
+    scan->setActiveScan(true);
+    scan->setInterval(80); // ~50ms
+    scan->setWindow(30);   // ~19ms
+    scan->setDuplicateFilter(true);
+    scan->setMaxResults(150);
+
+    uiLog("Scanning…");
+    s_scanning = true;
+    s_scanEnd  = millis() + seconds*1000UL;
+
+    // Non-blocking start: returns immediately
+    scan->start(seconds, /*is_continue=*/true);
 }
 
-// Connect to the MOON device with the strongest signal
-bool connectToBestMoon() {
-    if (foundDevices.empty()) {
-        updateBleLog("No MOON devices found");
+void stopScan(){
+    NimBLEDevice::getScan()->stop();
+    s_scanning = false;
+    uiLog("Scan stopped");
+}
+
+bool isScanning(){
+    finishIfTimedOut();
+    return s_scanning;
+}
+
+// -----------------------------
+// Snapshot for UI table (only MOON rows)
+// -----------------------------
+bool bleCopySnapshot(std::vector<MoonDeviceInfo>& out){
+    static uint32_t last_ver = 0;
+    uint32_t cur_ver = s_map.size() + (s_devicesDirty?1:0);
+    if (cur_ver == last_ver) {
+        // Even if map unchanged, ensure connected device appears
+        bool haveConnected = false;
+        for (auto &d: out) if (!connectedMac().empty() && d.mac == connectedMac()) { haveConnected = true; break; }
+        if (!connectedMac().empty() && !haveConnected) {
+            MoonDeviceInfo di;
+            di.mac = connectedMac();
+            di.name = connectedMac();
+            di.rssi = 0;
+            di.connected = true;
+            out.push_back(di);
+            return true;
+        }
         return false;
     }
-    // Sort by RSSI descending
-    std::sort(foundDevices.begin(), foundDevices.end(), [](const MoonDeviceInfo& a, const MoonDeviceInfo& b) {
-        return a.rssi > b.rssi;
-    });
-    NimBLEAdvertisedDevice* device = foundDevices.front().device;
-    updateBleLog(String("Connecting to ") + (device->haveName() ? device->getName().c_str() : device->toString().c_str()) + "...");
-    moonClient = NimBLEDevice::createClient();
-    if (!moonClient->connect(device)) {
-        updateBleLog("Failed to connect");
+
+    out.clear();
+    bool haveConnected = false;
+
+    for (auto &kv : s_map){
+        const auto &mac = kv.first;
+        const auto &r   = kv.second;
+        if (!r.moon) continue;
+        MoonDeviceInfo di;
+        di.mac = mac;
+        di.name = r.name.empty()? mac : r.name;
+        di.rssi = r.rssi;
+        di.connected = (!s_connectedMac.empty() && s_connectedMac == mac);
+        if (di.connected) haveConnected = true;
+        out.push_back(di);
+    }
+
+    // If we’re connected but haven’t seen the device yet this session,
+    // add a synthetic row for it so the user sees it immediately.
+    if (!s_connectedMac.empty() && !haveConnected) {
+        MoonDeviceInfo di;
+        di.mac = s_connectedMac;
+        di.name = s_connectedMac;
+        di.rssi = 0;
+        di.connected = true;
+        out.push_back(di);
+    }
+
+    std::sort(out.begin(), out.end(),
+              [](const MoonDeviceInfo&a,const MoonDeviceInfo&b){return a.rssi>b.rssi;});
+    last_ver = cur_ver;
+    s_devicesDirty = false;
+    return true;
+}
+// -----------------------------
+// Connect & send commands
+// -----------------------------
+bool isConnected(){ return s_client && s_client->isConnected(); }
+std::string connectedMac(){ return s_connectedMac; }
+
+bool connectToAddress(const std::string& addr){
+    if (s_scanning) stopScan();
+    uiLog(String("Connecting… ") + addr.c_str());
+
+    s_client = NimBLEDevice::createClient();
+    static ClientCB ccb; s_client->setClientCallbacks(&ccb, false);
+    s_client->setConnectTimeout(10);
+
+    for (int attempt=1; attempt<=2; ++attempt) {
+        if (s_client->connect(NimBLEAddress(addr))) break;
+        uiLog(String("Connect failed (try ") + attempt + ")");
+        if (attempt==2) return false;
+        delay(200);
+    }
+
+    NimBLERemoteService* svc = s_client->getService(NUS_SERVICE_UUID);
+    if (!svc) {
+        uiLog("UART service not found (UUIDs?)");
+        auto* svcs = s_client->getServices(true);
+        if (svcs) for (auto &s : *svcs) Serial.printf("  svc %s\n", s->getUUID().toString().c_str());
+        s_client->disconnect();
         return false;
     }
-    updateBleLog("Connected to MOON device");
-    // Obtain the UART service
-    NimBLERemoteService* pService = moonClient->getService(NUS_SERVICE_UUID);
-    if (!pService) {
-        updateBleLog("UART service not found");
-        moonClient->disconnect();
+
+    s_tx = svc->getCharacteristic(NUS_TX_CHAR_UUID);
+    s_rx = svc->getCharacteristic(NUS_RX_CHAR_UUID);
+    if (!s_tx || !s_rx) {
+        uiLog("UART chars missing (UUIDs?)");
+        s_client->disconnect();
         return false;
     }
-    txCharacteristic = pService->getCharacteristic(NUS_TX_CHAR_UUID);
-    rxCharacteristic = pService->getCharacteristic(NUS_RX_CHAR_UUID);
-    if (!txCharacteristic || !rxCharacteristic) {
-        updateBleLog("UART characteristics not found");
-        moonClient->disconnect();
-        return false;
+
+    if (s_rx->canNotify()){
+        s_rx->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* p, size_t n, bool){
+            String s="RX: "; for(size_t i=0;i<n;++i) s+=(char)p[i]; Serial.println(s);
+        });
     }
-    // Subscribe to RX notifications to receive acknowledgements
-    if (rxCharacteristic->canNotify()) {
-        rxCharacteristic->subscribe(true, onRxNotify);
-    }
+
+    s_connectedMac = addr;
+    s_devicesDirty = true;        // UI shows the checkmark
+    uiLog("Connected ✓");
+
+    // NEW: automatically request info from the MOON and log it
+    sendMoonCommand("{\"get_info\":true}");
+
     return true;
 }
 
-// Send a JSON command to the connected MOON device
-bool sendMoonCommand(const String& jsonCmd) {
-    if (!moonClient || !moonClient->isConnected() || !txCharacteristic) {
-        updateBleLog("Not connected to MOON device");
-        return false;
-    }
-    std::string str = jsonCmd.c_str();
-    bool success = txCharacteristic->writeValue((uint8_t*)str.data(), str.size(), false);
-    updateBleLog(String("Sent command: ") + jsonCmd);
-    return success;
+bool sendMoonCommand(const String& jsonCmd){
+    if (!isConnected() || !s_tx){ uiLog("Not connected"); return false; }
+    std::string s = jsonCmd.c_str();
+    bool ok = s_tx->writeValue((uint8_t*)s.data(), s.size(), false);
+    Serial.println(String("Sent: ")+jsonCmd);
+    return ok;
 }
-
-// Register a UI label to display log messages. Pass nullptr to
-// disable on-screen logging.
-void setBleLogLabel(lv_obj_t* label) {
-    bleLogLabel = label;
-}
-
-// Helper to update Serial and UI log simultaneously
-static void updateBleLog(const String& msg) {
-    Serial.println(msg);
-    if (bleLogLabel) {
-        // Copy the message into an LVGL compatible buffer. LVGL expects
-        // null-terminated C strings.
-        lv_label_set_text(bleLogLabel, msg.c_str());
-    }
-}
-
-/*
- * Stand‑alone demonstration entry points. These functions allow this
- * module to be compiled as an example sketch on its own. When
- * integrated into the UI demo firmware the UI code will provide its
- * own setup() and loop() functions, so these definitions should be
- * excluded. To enable the stand‑alone example define
- * MOON_ENCODER_BLE_STANDALONE before including this file.
- */
-#ifdef MOON_ENCODER_BLE_STANDALONE
-
-void setup() {
-    Serial.begin(115200);
-    Serial.println("Moon Encoder BLE Client starting...");
-    NimBLEDevice::init("");
-    // optional: set initial power level
-    NimBLEDevice::setPower(ESP_PWR_LVL_N9);
-    scanForMoonDevices(5);
-    if (connectToBestMoon()) {
-        // Example: send get_info request once connected
-        sendMoonCommand("{\"get_info\":true}");
-    }
-}
-
-void loop() {
-    // Example: send periodic commands or handle UI input
-    // Here we just keep the connection alive and process notifications
-    if (moonClient && !moonClient->isConnected()) {
-        Serial.println("Disconnected, rescanning...");
-        scanForMoonDevices(5);
-        connectToBestMoon();
-    }
-    delay(1000);
-}
-
-#endif // MOON_ENCODER_BLE_STANDALONE
