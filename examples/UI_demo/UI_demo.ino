@@ -7,6 +7,8 @@
 #include <FastLED.h>
 #include "EEPROM.h"
 #include <ESP32Servo.h>
+#include "ui_overlay.h"
+
 /*********************************************************************************
  *                              EXTERN
  *********************************************************************************/
@@ -281,6 +283,8 @@ void setup()
     lv_port_disp_init();
 
     lv_port_indev_init();
+
+    overlay_init();
     
     // ui_entry();
 
@@ -342,6 +346,6 @@ void loop()
 {
     lv_timer_handler(); /* let the GUI do its work */
     delay(1);
-
     ws2812_eff1();
+    overlay_update();
 }

@@ -27,7 +27,9 @@ bool blePopUiLog(String& out);                           // single-line status f
 // ---- Connection state ----
 bool connectToAddress(const std::string& addr);
 bool isConnected();
+bool isConnecting();
 std::string connectedMac();
 
 // ---- UART JSON command once connected ----
 bool sendMoonCommand(const String& jsonCmd);
+bool blePopLastJson(String& out);    // last complete JSON line from MOON

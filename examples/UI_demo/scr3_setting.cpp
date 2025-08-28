@@ -63,42 +63,43 @@ static void rebuild_table(bool includeRescanRow = true) {
     }
 }
 
+// --- handler: last row = rescan; otherwise connect with a light tap ---
 static void on_table_click(lv_event_t *e){
     lv_obj_t *tbl = lv_event_get_target(e);
-
-    // Get the selected cell (tap should select it)
     uint16_t row = LV_TABLE_CELL_NONE, col = LV_TABLE_CELL_NONE;
     lv_table_get_selected_cell(tbl, &row, &col);
     if (row == LV_TABLE_CELL_NONE) return;
 
-    uint16_t dataRows = g_snap.size();
-    uint16_t lastRow  = 1 + dataRows; // header + data -> rescan row index
+    const uint16_t dataRows = g_snap.size();
+    const uint16_t rescanRow = 1 + dataRows;     // header + data
 
-    // If user tapped the last row => Rescan/Stop
-    if (row == lastRow) {
-        if (isScanning()) stopScan();
-        else startScanAsync(5);           // requested: 5s rescan
-        rebuild_table();                  // update tail caption immediately
+    if (row == rescanRow) {                      // tail row -> rescan/stop
+        if (isScanning()) {
+            stopScan();
+            //overlay_hide();
+        }
+        else {
+            //overlay_show("Scanning…");
+            startScanAsync(5);                  // 5 s rescan
+        }
+        rebuild_table();
         return;
     }
+    if (row == 0) return;                        // header
 
-    // Ignore header row
-    if (row == 0) return;
-
-    // Otherwise: connect to that device (soft tap)
-    uint16_t idx = row - 1;
+    // connect
+    const uint16_t idx = row - 1;
     if (idx >= g_snap.size()) return;
 
-    // For reliability: stop any ongoing scan
-    if (isScanning()) stopScan();
-
+    if (isScanning()) stopScan();                // free controller
     connectToAddress(g_snap[idx].mac);
 
-    // Update UI immediately
+    // refresh table immediately (✔ moves to the new device)
     std::vector<MoonDeviceInfo> now;
     if (bleCopySnapshot(now)) g_snap.swap(now);
     rebuild_table();
 }
+
 
 static void tick_cb(lv_timer_t *){
     // Pump one pending UI line if any
@@ -135,7 +136,13 @@ void create3(lv_obj_t *parent)
     lv_table_set_col_width(g_table, 1, 40);
     lv_obj_set_style_text_font(g_table, &lv_font_montserrat_14, LV_PART_ITEMS);
     lv_obj_align(g_table, LV_ALIGN_TOP_MID, 0, 52);
-    enable_easy_tap(g_table);
+    
+    // Make tap very easy
+    lv_obj_add_flag(g_table, LV_OBJ_FLAG_CLICKABLE);
+    #ifdef LV_TABLE_CELL_SELECT_MODE_SINGLE
+    lv_table_set_cell_select_mode(g_table, LV_TABLE_CELL_SELECT_MODE_SINGLE);
+    #endif
+    lv_obj_add_event_cb(g_table, on_table_click, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(g_table, on_table_click, LV_EVENT_CLICKED, NULL);
 
     // Start a short scan automatically when opening if not connected

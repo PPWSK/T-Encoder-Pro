@@ -19,6 +19,9 @@ static NimBLEClient*               s_client = nullptr;
 static NimBLERemoteCharacteristic* s_tx     = nullptr;
 static NimBLERemoteCharacteristic* s_rx     = nullptr;
 static std::string                 s_connectedMac;
+static std::string                 s_connectedName;
+static bool                        s_connectBusy = false; // guard against double taps
+
 
 struct Rec { std::string name; int rssi = -127; bool moon=false; };
 static std::unordered_map<std::string, Rec> s_map;   // key=MAC
@@ -33,6 +36,7 @@ static volatile bool s_uiLogDirty = false;
 static String s_uiLine;
 static inline void uiLog(const String& msg){ Serial.println(msg); s_uiLine = msg; s_uiLogDirty = true; }
 bool blePopUiLog(String& out){ if(!s_uiLogDirty) return false; out = s_uiLine; s_uiLogDirty=false; return true; }
+bool isConnecting(){ return s_connectBusy;}
 
 // -----------------------------
 // Init
@@ -76,6 +80,10 @@ class CB : public NimBLEAdvertisedDeviceCallbacks {
 
         if (d->haveName()) r.name = d->getName();
         if (d->getRSSI() > r.rssi) r.rssi = d->getRSSI();
+
+        if (!s_connectedMac.empty() && s_connectedMac == mac && !r.name.empty()) {
+            s_connectedName = r.name;
+        }
 
         bool wasMoon = r.moon;
         r.moon = looksLikeMoon(d);
@@ -143,28 +151,22 @@ bool isScanning(){
     return s_scanning;
 }
 
+// JSON line feed (assumes MOON replies one JSON per notify, or newline-terminated)
+static String s_lastJson;
+static volatile bool s_jsonDirty = false;
+
+bool blePopLastJson(String& out){
+    if (!s_jsonDirty) return false;
+    out = s_lastJson;
+    s_jsonDirty = false;
+    return true;
+}
+
+
 // -----------------------------
 // Snapshot for UI table (only MOON rows)
 // -----------------------------
 bool bleCopySnapshot(std::vector<MoonDeviceInfo>& out){
-    static uint32_t last_ver = 0;
-    uint32_t cur_ver = s_map.size() + (s_devicesDirty?1:0);
-    if (cur_ver == last_ver) {
-        // Even if map unchanged, ensure connected device appears
-        bool haveConnected = false;
-        for (auto &d: out) if (!connectedMac().empty() && d.mac == connectedMac()) { haveConnected = true; break; }
-        if (!connectedMac().empty() && !haveConnected) {
-            MoonDeviceInfo di;
-            di.mac = connectedMac();
-            di.name = connectedMac();
-            di.rssi = 0;
-            di.connected = true;
-            out.push_back(di);
-            return true;
-        }
-        return false;
-    }
-
     out.clear();
     bool haveConnected = false;
 
@@ -172,32 +174,35 @@ bool bleCopySnapshot(std::vector<MoonDeviceInfo>& out){
         const auto &mac = kv.first;
         const auto &r   = kv.second;
         if (!r.moon) continue;
+
         MoonDeviceInfo di;
-        di.mac = mac;
-        di.name = r.name.empty()? mac : r.name;
-        di.rssi = r.rssi;
+        di.mac       = mac;
+        di.name      = r.name.empty()? mac : r.name;
+        di.rssi      = r.rssi;
         di.connected = (!s_connectedMac.empty() && s_connectedMac == mac);
         if (di.connected) haveConnected = true;
         out.push_back(di);
     }
 
-    // If we’re connected but haven’t seen the device yet this session,
-    // add a synthetic row for it so the user sees it immediately.
     if (!s_connectedMac.empty() && !haveConnected) {
         MoonDeviceInfo di;
-        di.mac = s_connectedMac;
-        di.name = s_connectedMac;
-        di.rssi = 0;
+        di.mac       = s_connectedMac;
+        di.name      = s_connectedName.empty()? s_connectedMac : s_connectedName;
+        di.rssi      = 0;
         di.connected = true;
         out.push_back(di);
     }
 
     std::sort(out.begin(), out.end(),
-              [](const MoonDeviceInfo&a,const MoonDeviceInfo&b){return a.rssi>b.rssi;});
-    last_ver = cur_ver;
+        [](const MoonDeviceInfo& a, const MoonDeviceInfo& b){
+            if (a.connected != b.connected) return a.connected; // connected first
+            return a.rssi > b.rssi;
+        });
+
     s_devicesDirty = false;
-    return true;
+    return true; // always refresh after connect/disconnect
 }
+
 // -----------------------------
 // Connect & send commands
 // -----------------------------
@@ -205,26 +210,47 @@ bool isConnected(){ return s_client && s_client->isConnected(); }
 std::string connectedMac(){ return s_connectedMac; }
 
 bool connectToAddress(const std::string& addr){
+    if (s_connectBusy) return false;
+    s_connectBusy = true;
+
     if (s_scanning) stopScan();
+
+    // Switching device? Disconnect first.
+    if (s_client && s_client->isConnected() && s_connectedMac != addr) {
+        uiLog(String("Disconnecting… ") + s_connectedMac.c_str());
+        s_client->disconnect();
+        delay(150);
+        s_connectedMac.clear();
+        s_connectedName.clear();
+    }
+
     uiLog(String("Connecting… ") + addr.c_str());
 
-    s_client = NimBLEDevice::createClient();
+    if (!s_client) s_client = NimBLEDevice::createClient();
     static ClientCB ccb; s_client->setClientCallbacks(&ccb, false);
     s_client->setConnectTimeout(10);
 
-    for (int attempt=1; attempt<=2; ++attempt) {
-        if (s_client->connect(NimBLEAddress(addr))) break;
-        uiLog(String("Connect failed (try ") + attempt + ")");
-        if (attempt==2) return false;
-        delay(200);
+    // Retry more times with small backoff
+    const int kMaxAttempts = 3;
+    bool linked = false;
+    for (int attempt=1; attempt<=kMaxAttempts; ++attempt) {
+        if (s_client->connect(NimBLEAddress(addr))) { linked = true; break; }
+        uiLog(String("Connect failed (try ") + attempt + ")"); 
+        delay(150 + attempt*100); // backoff
     }
+    if (!linked) { s_connectBusy = false; return false; }
+
+    // Make sure services are fresh (prevents stale handles)
+    s_client->discoverAttributes();
 
     NimBLERemoteService* svc = s_client->getService(NUS_SERVICE_UUID);
     if (!svc) {
         uiLog("UART service not found (UUIDs?)");
         auto* svcs = s_client->getServices(true);
-        if (svcs) for (auto &s : *svcs) Serial.printf("  svc %s\n", s->getUUID().toString().c_str());
+        if (svcs) for (auto &s : *svcs)
+            Serial.printf("  svc %s\n", s->getUUID().toString().c_str());
         s_client->disconnect();
+        s_connectBusy = false;
         return false;
     }
 
@@ -233,24 +259,39 @@ bool connectToAddress(const std::string& addr){
     if (!s_tx || !s_rx) {
         uiLog("UART chars missing (UUIDs?)");
         s_client->disconnect();
+        s_connectBusy = false;
         return false;
     }
 
     if (s_rx->canNotify()){
-        s_rx->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* p, size_t n, bool){
-            String s="RX: "; for(size_t i=0;i<n;++i) s+=(char)p[i]; Serial.println(s);
-        });
+        s_rx->subscribe(
+            true,
+            [](NimBLERemoteCharacteristic* /*chr*/, uint8_t* p, size_t n, bool /*isNotify*/){
+                // Build a String (one-per-notify or one-per-line per your MOON firmware)
+                String line; line.reserve(n + 4);
+                for (size_t i = 0; i < n; ++i) line += (char)p[i];
+
+                Serial.println("RX: " + line);   // keep serial logging
+                s_lastJson = line;               // make last JSON available to UI
+                s_jsonDirty = true;
+            }
+        );
     }
 
     s_connectedMac = addr;
-    s_devicesDirty = true;        // UI shows the checkmark
+    auto it = s_map.find(addr);
+    s_connectedName = (it != s_map.end() && !it->second.name.empty()) ? it->second.name : addr;
+
+    s_devicesDirty = true;
     uiLog("Connected ✓");
 
-    // NEW: automatically request info from the MOON and log it
+    // Ask device for info right away
     sendMoonCommand("{\"get_info\":true}");
 
+    s_connectBusy = false;
     return true;
 }
+
 
 bool sendMoonCommand(const String& jsonCmd){
     if (!isConnected() || !s_tx){ uiLog("Not connected"); return false; }
